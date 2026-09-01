@@ -83,6 +83,35 @@ inline int64_t gather_pages(int64_t total_pages) {
 // operator a *host* KV cache and times the copy, whereas a real serving stack (vLLM) writes
 // the KV cache into device memory as it is produced and never uploads it. This mode models
 // that, and its numbers are reported separately -- never as the headline.
+// MQA_RAMP=1 ramps the slice size 64,128,256,...,gmax instead of using a fixed gmax, on
+// the theory that the gather ahead of the first DMA is exposed latency worth shortening.
+// Measured: neutral on TC1 and ~1% worse on TC2 (768/774/776 -> 765/768/760 GFLOPS). The
+// small early slices drain faster than the gather refills them, so the copy engine idles
+// three times at the start and gives back more than the shorter first gather saves.
+inline bool slice_ramp() { static bool v = env_int("MQA_RAMP", 0) != 0; return v; }
+// MQA_MAPOUT=1: the kernel stores the logits straight into mapped pinned host memory, so
+// there is no D2H copy at all. The measured D2H is 0.089 ms on TC1 for 0.25 MiB (2.8 GB/s)
+// and 0.259 ms on TC2 for 2.9 MiB -- mostly fixed latency, which is worth deleting rather
+// than shrinking. The stores are coalesced 256-byte runs, and cudaDeviceSynchronize below
+// is what makes them visible to the host, exactly as it was for the copy.
+// Team size for every host-side parallel region. The harness never sets OMP_NUM_THREADS,
+// so the default team is one thread per hardware thread -- 32 on this box -- and that
+// alone costs 36% of TC1. The gather is host-DRAM-bandwidth bound, a handful of threads
+// already saturates it, and past that every extra thread only adds join time to the
+// per-slice barrier. Measured here, TC1/TC2 GFLOPS: 4 -> 991/789, 6 -> 1016/776,
+// 8 -> 1032/791, 10 -> 1025/792, 12 -> 1009/784, 16 -> 955/760, 32 -> 658/739. The
+// heuristic keeps roughly one thread per physical core pair so a bigger host with more
+// memory channels still gets more threads; MQA_THREADS overrides it.
+inline int host_threads() {
+    static int v = 0;
+    if (v) return v;
+    const int hw = omp_get_max_threads();
+    int n = env_int("MQA_THREADS", 0);
+    if (n <= 0) { n = hw / 4; if (n < 4) n = 4; if (n > 16) n = 16; }
+    v = n > hw ? hw : n;
+    return v;
+}
+inline bool map_out() { static bool v = env_int("MQA_MAPOUT", 1) != 0; return v; }
 inline bool force_generic() { static bool v = env_int("MQA_FORCE_GENERIC", 0) != 0; return v; }
 inline bool resident_kv() { static bool v = env_int("MQA_RESIDENT_KV", 0) != 0; return v; }
 
@@ -124,6 +153,75 @@ struct Prof {
 };
 inline Prof &prof() { static Prof p; return p; }
 
+// Device-side timeline, enabled with MQA_TIMELINE=1. Prof above cannot see inside its own
+// `sync` phase: it knows how long the wait was, not where the copy engine and the SMs sat
+// during it. This records begin/end events around every H2D slice, every kernel and every
+// D2H, then reports engine-busy time and the bubble (span - busy) -- the exact quantity an
+// overlap rewrite has to convert into useful work. Off by default, because each
+// cudaEventRecord is another ~15 us API call under WSL2 and would perturb what it measures.
+struct TL {
+    std::vector<cudaEvent_t> pool;   // reused across calls; nothing is created while timing
+    size_t used = 0;
+    std::vector<int> kind;           // 0 = H2D, 1 = kernel, 2 = D2H
+    std::vector<cudaEvent_t> eb, ee;
+    cudaEvent_t zero = nullptr;
+    double h2d = 0, kern = 0, d2h = 0, span = 0;
+    int64_t sig = 0;
+    long n = 0;
+    bool on = getenv("MQA_TIMELINE") != nullptr;
+    static const long kWarm = 10;
+
+    cudaEvent_t get() {
+        if (used == pool.size()) {
+            cudaEvent_t e;
+            CUDA_CHECK(cudaEventCreate(&e));
+            pool.push_back(e);
+        }
+        return pool[used++];
+    }
+    void open(cudaStream_t s) {
+        if (!on) return;
+        used = 0; kind.clear(); eb.clear(); ee.clear();
+        if (!zero) CUDA_CHECK(cudaEventCreate(&zero));
+        CUDA_CHECK(cudaEventRecord(zero, s));
+    }
+    void begin(int k, cudaStream_t s) {
+        if (!on) return;
+        kind.push_back(k); eb.push_back(get()); ee.push_back(get());
+        CUDA_CHECK(cudaEventRecord(eb.back(), s));
+    }
+    void end(cudaStream_t s) { if (on) CUDA_CHECK(cudaEventRecord(ee.back(), s)); }
+    // Called once the device is idle, so every event already has a timestamp.
+    void close() {
+        if (!on) return;
+        double last = 0;
+        for (size_t i = 0; i < kind.size(); ++i) {
+            float b = 0, e = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&b, zero, eb[i]));
+            CUDA_CHECK(cudaEventElapsedTime(&e, zero, ee[i]));
+            const double d = (double)e - (double)b;
+            if (kind[i] == 0)      h2d  += d;
+            else if (kind[i] == 1) kern += d;
+            else                   d2h  += d;
+            if ((double)e > last) last = (double)e;
+        }
+        span += last;
+    }
+    void mark(int64_t s) { if (!on || s == sig) return; sig = s; n = 0; h2d = kern = d2h = span = 0; }
+    void tick() {
+        if (!on) return;
+        if (++n == kWarm) { h2d = kern = d2h = span = 0; return; }
+        if (n % 100) return;
+        const double d = (double)(n - kWarm);
+        const double busy = (h2d + kern + d2h) / d, sp = span / d;
+        fprintf(stderr, "[tl] h2d %.3f | kern %.3f | d2h %.3f | busy %.3f | span %.3f | "
+                        "bubble %.3f (%.0f%%) ms/call over %ld%c",
+                h2d / d, kern / d, d2h / d, busy, sp, sp - busy,
+                sp > 0 ? 100.0 * (sp - busy) / sp : 0.0, n - kWarm, 10);
+    }
+};
+inline TL &tl() { static TL t; return t; }
+
 // Shared-memory row stride, in bf16 elements. 136 = 68 four-byte words, and 68 % 32 == 4,
 // so the 8 rows a warp touches in one mma fragment land on 8 different banks; with the
 // natural stride of 128 (64 words, 64 % 32 == 0) all 8 rows collide on one bank and every
@@ -153,23 +251,41 @@ __device__ __forceinline__ void mma_m16n8k16(float (&d)[4], const uint32_t (&a)[
 // so the operator stays correct off the graded shape, not to win the benchmark.
 constexpr int kMaxDimPerLane = 16;   // dim <= 512
 
+// One page of K (64 tokens x 128 dim = 16 KiB) staged global -> shared by the async copy
+// engine: no register staging, no LDG/STS dependency, and the warp stays free to run other
+// instructions until the matching wait. 1024 sixteen-byte lines, two per thread.
+__device__ __forceinline__ void cp_page(__nv_bfloat16 *sK, const __nv_bfloat16 *kv,
+                                        int phys, int tid)
+{
+    const char *const src = (const char *)(kv + (size_t)phys * kBlockSize * kDim);
+    #pragma unroll
+    for (int i = tid; i < (kBlockSize * kDim) / 8; i += kThreads) {
+        const unsigned dst = (unsigned)__cvta_generic_to_shared(
+                &sK[(i >> 4) * kSmemStride + (i & 15) * 8]);
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::
+                     "r"(dst), "l"(src + (size_t)i * 16));
+    }
+    asm volatile("cp.async.commit_group;");
+}
+__device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group 0;"); }
+
 __global__ __launch_bounds__(kThreads) void mqa_logits_generic(
     const __nv_bfloat16 *__restrict__ q, const __nv_bfloat16 *__restrict__ kv,
     const int32_t *__restrict__ block_tables, const int32_t *__restrict__ context_lens,
     const float *__restrict__ weights, float *__restrict__ logits,
     int bn_base, int next_n, int num_heads, int dim, int block_size,
-    int max_model_len, int tokens_hi, int max_num_blocks)
+    int out_stride, int tokens_hi, int max_num_blocks)
 {
     const int warps = blockDim.x >> 5;
     const int lane = threadIdx.x & 31;
     const int t = (blockIdx.x * warps + (threadIdx.x >> 5));
-    if (t >= tokens_hi || t >= max_model_len) return;
+    if (t >= tokens_hi || t >= out_stride) return;
 
     const int bn = bn_base + blockIdx.y;
     const int batch_idx = bn / next_n;
     const int n = bn - batch_idx * next_n;
     const int t_limit = context_lens[batch_idx] - next_n + n;
-    float *const out_row = logits + (size_t)bn * max_model_len;
+    float *const out_row = logits + (size_t)blockIdx.y * out_stride;
 
     if (t > t_limit) {
         if (lane == 0) out_row[t] = -INFINITY;
@@ -219,8 +335,8 @@ __global__ __launch_bounds__(kThreads) void mqa_logits_v4(
         const int32_t *__restrict__ block_tables,   // [B, max_num_blocks] -> compact id
         const int32_t *__restrict__ context_lens,   // [B]
         const float *__restrict__ weights,          // [B * next_n, 64]
-        float *__restrict__ logits,                 // [B * next_n, max_model_len]
-        int bn_base, int next_n, int max_model_len, int pages_used, int max_num_blocks)
+        float *__restrict__ logits,                 // packed [rows, out_stride]
+        int bn_base, int next_n, int out_stride, int pages_used, int max_num_blocks)
 {
     const int tid = threadIdx.x;
     const int bn  = bn_base + blockIdx.y;
@@ -232,13 +348,13 @@ __global__ __launch_bounds__(kThreads) void mqa_logits_v4(
     const int p_begin   = blockIdx.x * kPagesPerBlock;
     const int p_end     = min(p_begin + kPagesPerBlock, min(pages_used, max_num_blocks));
 
-    float *out_row = logits + (size_t)bn * max_model_len;
+    float *out_row = logits + (size_t)blockIdx.y * out_stride;
 
     // Every page this block owns is masked: stamp -inf, touch no KV, issue no mma.
     if (p_begin * kBlockSize > t_limit) {
         for (int page = p_begin; page < p_end; ++page) {
             const int tg = page * kBlockSize + tid;
-            if (tid < kBlockSize && tg < max_model_len) out_row[tg] = -INFINITY;
+            if (tid < kBlockSize && tg < out_stride) out_row[tg] = -INFINITY;
         }
         return;
     }
@@ -247,6 +363,20 @@ __global__ __launch_bounds__(kThreads) void mqa_logits_v4(
     __shared__ __nv_bfloat16 sK[kBlockSize * kSmemStride];   // 17 KiB
     __shared__ float sW[kNumHeads];
     __shared__ float sPart[4][kBlockSize];                   // per head-group partials
+
+    // ---- paged prefetch: the slice of the page table this block owns goes to registers in
+    // one burst of independent loads, so no data fetch is ever gated on a dependent load of
+    // the physical id it needs, and the next page can be issued the moment sK frees up.
+    int phys[kPagesPerBlock];
+    #pragma unroll
+    for (int i = 0; i < kPagesPerBlock; ++i) {
+        const int page = p_begin + i;
+        phys[i] = (page < p_end && page * kBlockSize <= t_limit)
+                ? block_tables[(size_t)batch_idx * max_num_blocks + page] : -1;
+    }
+    // Page 0 travels while Q is staged: the two are independent, so the first page costs
+    // nothing beyond what the Q load already pays for.
+    if (phys[0] >= 0) cp_page(sK, kv, phys[0], tid);
 
     // ---- stage Q (all 64 heads of this query row) and the head weights, once ----
     {
@@ -267,18 +397,13 @@ __global__ __launch_bounds__(kThreads) void mqa_logits_v4(
     __syncthreads();
     const float wa = sW[h0 + g], wb = sW[h0 + g + 8];
 
-    for (int page = p_begin; page < p_end && page * kBlockSize <= t_limit; ++page) {
+    for (int page = p_begin, pi = 0; page < p_end && page * kBlockSize <= t_limit;
+         ++page, ++pi) {
         const int t_base = page * kBlockSize;
 
-        // ---- stage this page's K; block_size == page size, so one lookup covers it ----
-        {
-            const int32_t phys = block_tables[(size_t)batch_idx * max_num_blocks + page];
-            const uint4 *src =
-                reinterpret_cast<const uint4 *>(kv + (size_t)phys * kBlockSize * kDim);
-            #pragma unroll
-            for (int i = tid; i < (kBlockSize * kDim) / 8; i += kThreads)
-                *reinterpret_cast<uint4 *>(&sK[(i >> 4) * kSmemStride + (i & 15) * 8]) = src[i];
-        }
+        // The K for this page was issued an iteration ago (or before the Q stage, for the
+        // first one); the barrier that publishes it also frees sPart from the previous page.
+        cp_wait();
         __syncthreads();
 
         float acc[4][4];
@@ -326,22 +451,26 @@ __global__ __launch_bounds__(kThreads) void mqa_logits_v4(
         }
 
         // ---- sum the 4 head groups and write the tile, applying the causal mask ----
+        // This barrier does double duty: it publishes sPart and it certifies that every warp
+        // is done reading sK, so the next page can start landing on top of sK right away and
+        // its 16 KiB fly while this tile is reduced and pushed out to global.
         __syncthreads();
+        if (pi + 1 < kPagesPerBlock && phys[pi + 1] >= 0)
+            cp_page(sK, kv, phys[pi + 1], tid);
         if (tid < kBlockSize) {
             const int tg = t_base + tid;
-            if (tg < max_model_len) {
+            if (tg < out_stride) {
                 const float s = sPart[0][tid] + sPart[1][tid] + sPart[2][tid] + sPart[3][tid];
                 out_row[tg] = (tg <= t_limit) ? s : -INFINITY;
             }
         }
-        __syncthreads();   // sK and sPart are about to be reused by the next page
     }
 
     // Pages this block owns that lie entirely past the mask still need -inf.
     for (int page = p_begin; page < p_end; ++page) {
         if (page * kBlockSize <= t_limit) continue;
         const int tg = page * kBlockSize + tid;
-        if (tid < kBlockSize && tg < max_model_len) out_row[tg] = -INFINITY;
+        if (tid < kBlockSize && tg < out_stride) out_row[tg] = -INFINITY;
     }
 }
 
@@ -350,13 +479,15 @@ __global__ __launch_bounds__(kThreads) void mqa_logits_v4(
 //  across the 100 timed runs (allocation is not part of the algorithm).
 // -------------------------------------------------------------------------------------
 struct Ctx {
-    void *d_kv = nullptr, *d_q = nullptr, *d_bt = nullptr, *d_cl = nullptr,
-         *d_w = nullptr, *d_out = nullptr;
-    size_t c_kv = 0, c_q = 0, c_bt = 0, c_cl = 0, c_w = 0, c_out = 0;
+    // Q, weights, block_tables and context_lens share one staging buffer and travel in a
+    // single cudaMemcpyAsync: under WSL2 each separate call costs ~20 us of API time, which
+    // on TC1 is 7% of the whole operator.
+    void *d_kv = nullptr, *d_meta = nullptr, *d_out = nullptr;
+    size_t c_kv = 0, c_meta = 0, c_out = 0;
 
-    void *h_kv = nullptr, *h_q = nullptr, *h_bt = nullptr, *h_cl = nullptr,
-         *h_w = nullptr, *h_out = nullptr;
-    size_t p_kv = 0, p_q = 0, p_bt = 0, p_cl = 0, p_w = 0, p_out = 0;
+    void *h_kv = nullptr, *h_meta = nullptr, *h_out = nullptr;
+    size_t p_kv = 0, p_meta = 0, p_out = 0;
+    void *m_out = nullptr;   // device-side alias of h_out, when it is mapped
 
     std::unordered_map<const void *, Pool> pools;  // resident mode only
     int64_t shape_sig = 0;                         // reset pools when the testcase changes
@@ -365,7 +496,7 @@ struct Ctx {
     std::vector<int64_t> page_begin;  // per batch, first compact id
     // Per chunk: which rows it produced and how many columns of them are live. Everything
     // past that is -inf by construction, so it is never sent over PCIe (see the D2H below).
-    std::vector<int64_t> seg_bn0, seg_bnc, seg_live;
+    std::vector<int64_t> seg_bn0, seg_bnc, seg_live, seg_off;
 
     cudaStream_t stream[kMaxStreams] = {};
     cudaEvent_t  meta_ready = nullptr;
@@ -378,11 +509,12 @@ struct Ctx {
         CUDA_CHECK(cudaMalloc(p, need));
         cap = need;
     }
-    static void ensure_pin(void **p, size_t &cap, size_t need) {
+    static void ensure_pin(void **p, size_t &cap, size_t need,
+                           unsigned flags = cudaHostAllocDefault) {
         if (cap >= need) return;
         if (*p) CUDA_CHECK(cudaFreeHost(*p));
         need = need + need / 4 + 256;
-        CUDA_CHECK(cudaHostAlloc(p, need, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(p, need, flags));
         cap = need;
     }
     void boot() {
@@ -401,7 +533,7 @@ inline void par_memcpy(void *dst, const void *src, size_t bytes)
 {
     constexpr size_t kGrain = 1 << 20;
     const int64_t nchunk = (int64_t)((bytes + kGrain - 1) / kGrain);
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(host_threads())
     for (int64_t i = 0; i < nchunk; ++i) {
         const size_t off = (size_t)i * kGrain;
         const size_t len = bytes - off < kGrain ? bytes - off : kGrain;
@@ -447,16 +579,26 @@ inline void indexer_bf16_paged_mqa_logits(
     const size_t page_bytes = (size_t)block_size * dim * sizeof(bfloat16_t);
     auto &pf = mqa::prof();
     pf.mark(B * 1000003 + next_n * 101 + mnb * 7 + (int64_t)kv_cache.numel());
+    mqa::tl().mark(B * 1000003 + next_n * 101 + mnb * 7 + (int64_t)kv_cache.numel());
     double t0 = get_clock_us(), t_gather = 0;
 
     // ---- plan the compaction: which physical pages are actually referenced ----
     // kv_cache is sized for max_model_len; a batch only touches ceil(ctx/block_size)
     // pages. Renumber those into a dense pool and rewrite the block table to match.
     const size_t bt_bytes = (size_t)B * mnb * sizeof(int32_t);
-    mqa::Ctx::ensure_pin(&c.h_bt, c.p_bt, bt_bytes);
-    mqa::Ctx::ensure_pin(&c.h_cl, c.p_cl, (size_t)B * sizeof(int32_t));
-    int32_t *hbt = (int32_t *)c.h_bt;
-    int32_t *hcl = (int32_t *)c.h_cl;
+    const size_t cl_bytes = (size_t)B * sizeof(int32_t);
+    const size_t q_bytes  = (size_t)q.numel() * sizeof(bfloat16_t);
+    const size_t w_bytes  = (size_t)weights.numel() * sizeof(float);
+    // One buffer, four regions, 256-byte aligned so every view keeps its natural alignment.
+    auto al = [](size_t x) { return (x + 255) & ~(size_t)255; };
+    const size_t off_q = 0, off_w = al(q_bytes), off_bt = al(off_w + w_bytes),
+                 off_cl = al(off_bt + bt_bytes), meta_bytes = off_cl + cl_bytes;
+    mqa::Ctx::ensure_pin(&c.h_meta, c.p_meta, meta_bytes);
+    mqa::Ctx::ensure_dev(&c.d_meta, c.c_meta, meta_bytes);
+    char *const hm = (char *)c.h_meta;
+    char *const dm = (char *)c.d_meta;
+    int32_t *hbt = (int32_t *)(hm + off_bt);
+    int32_t *hcl = (int32_t *)(hm + off_cl);
     memset(hbt, 0, bt_bytes);
 
     const int64_t *bt_src = block_tables.data_ptr();
@@ -479,30 +621,27 @@ inline void indexer_bf16_paged_mqa_logits(
     c.page_begin[B] = total_pages;
 
     // ---- buffers ----
-    const size_t q_bytes = (size_t)q.numel() * sizeof(bfloat16_t);
-    const size_t w_bytes = (size_t)weights.numel() * sizeof(float);
     const size_t o_bytes = (size_t)output.numel() * sizeof(float);
 
-    mqa::Ctx::ensure_pin(&c.h_q, c.p_q, q_bytes);
-    mqa::Ctx::ensure_pin(&c.h_w, c.p_w, w_bytes);
-    mqa::Ctx::ensure_pin(&c.h_out, c.p_out, o_bytes);
+    const size_t out_was = c.p_out;
+    mqa::Ctx::ensure_pin(&c.h_out, c.p_out, o_bytes,
+                         mqa::map_out() ? cudaHostAllocMapped : cudaHostAllocDefault);
+    if (mqa::map_out() && c.p_out != out_was)
+        CUDA_CHECK(cudaHostGetDevicePointer(&c.m_out, c.h_out, 0));
     // Worst-case capacity, so nothing regrows mid-run: a testcase cycles through several
     // datasets whose context_lens differ, and a cudaHostAlloc/cudaFree pair inside a timed
     // call costs far more than the transfer it serves.
     const size_t kv_cap = (size_t)B * mnb * page_bytes;
     mqa::Ctx::ensure_pin(&c.h_kv, c.p_kv, kv_cap);
-    mqa::Ctx::ensure_dev(&c.d_q, c.c_q, q_bytes);
-    mqa::Ctx::ensure_dev(&c.d_w, c.c_w, w_bytes);
-    mqa::Ctx::ensure_dev(&c.d_out, c.c_out, o_bytes);
+    if (!mqa::map_out()) mqa::Ctx::ensure_dev(&c.d_out, c.c_out, o_bytes);
+    void *const out_dev = mqa::map_out() ? c.m_out : c.d_out;
     mqa::Ctx::ensure_dev(&c.d_kv, c.c_kv, kv_cap);
-    mqa::Ctx::ensure_dev(&c.d_bt, c.c_bt, bt_bytes);
-    mqa::Ctx::ensure_dev(&c.d_cl, c.c_cl, (size_t)B * sizeof(int32_t));
 
     // ---- where the compacted KV lives ----
     // Default: one scratch pool, refilled from the host on every call (the honest number).
     // MQA_RESIDENT_KV=1: one pool per (kv_cache pointer, block_tables, context_lens) triple,
     // so a repeated dataset skips the gather and the H2D entirely -- see resident_kv().
-    void *dev_kv = c.d_kv, *dev_bt = c.d_bt, *dev_cl = c.d_cl;
+    void *dev_kv = c.d_kv, *dev_bt = dm + off_bt, *dev_cl = dm + off_cl;
     bool upload_kv = true;
     if (mqa::resident_kv()) {
         const int64_t sig = B * 1000003 + next_n * 101 + mnb * 7 + (int64_t)kv_cache.numel();
@@ -526,7 +665,7 @@ inline void indexer_bf16_paged_mqa_logits(
         // A grow here reallocates, so it can only happen on a fresh pool (ready == false).
         mqa::Ctx::ensure_dev(&pl.d_kv, pl.c_kv, (size_t)total_pages * page_bytes);
         mqa::Ctx::ensure_dev(&pl.d_bt, pl.c_bt, bt_bytes);
-        mqa::Ctx::ensure_dev(&pl.d_cl, pl.c_cl, (size_t)B * sizeof(int32_t));
+        mqa::Ctx::ensure_dev(&pl.d_cl, pl.c_cl, cl_bytes);
         dev_kv = pl.d_kv; dev_bt = pl.d_bt; dev_cl = pl.d_cl;
         upload_kv = !same;
         if (!same) {
@@ -540,42 +679,59 @@ inline void indexer_bf16_paged_mqa_logits(
     pf.plan += get_clock_us() - t0;
     t0 = get_clock_us();
 
-    // ---- metadata + Q up front; every stream waits on it once ----
-    mqa::par_memcpy(c.h_q, q.data_ptr(), q_bytes);
-    memcpy(c.h_w, weights.data_ptr(), w_bytes);
-    CUDA_CHECK(cudaMemcpyAsync(c.d_q, c.h_q, q_bytes, cudaMemcpyHostToDevice, c.stream[0]));
-    CUDA_CHECK(cudaMemcpyAsync(c.d_w, c.h_w, w_bytes, cudaMemcpyHostToDevice, c.stream[0]));
-    if (upload_kv) {
-        CUDA_CHECK(cudaMemcpyAsync(dev_bt, c.h_bt, bt_bytes, cudaMemcpyHostToDevice, c.stream[0]));
-        CUDA_CHECK(cudaMemcpyAsync(dev_cl, c.h_cl, (size_t)B * sizeof(int32_t),
-                                   cudaMemcpyHostToDevice, c.stream[0]));
+    // Kernel-launch granularity. One launch for the whole batch by default. Splitting it is
+    // what would let a chunk compute while the next one copies, and it is measured badly
+    // negative: with the device timeline on, h2d busy time stays flat (0.72 ms TC1, 9.8 ms
+    // TC2) at every chunk size while the kernel and D2H device intervals balloon --
+    // TC1 kern 0.176/0.306/0.486/0.812 ms and TC2 kern 0.53/4.48/7.15/10.57 ms for
+    // 1/2/4/8 chunks and 1/38/76/152 chunks respectively. That is ~70 us of dispatch latency
+    // per kernel node and ~60 us per copy node, paid on the stream, because this is WSL2 and
+    // every submission crosses the paravirtualised channel. A boundary can hide at most half
+    // the kernel (0.09 ms on TC1) and costs more than that to place, so the overlap never
+    // pays. See MQA_CHUNK in OPTIMIZATION.md.
+    int64_t chunk_pages = mqa::chunk_pages_env();
+    if (chunk_pages <= 0) chunk_pages = total_pages > 0 ? total_pages : 1;
+    if (chunk_pages < 16) chunk_pages = 16;
+    const bool multi_stream = mqa::n_streams() > 1 && chunk_pages < total_pages;
+
+    // ---- metadata + Q up front, in a single transfer ----
+    mqa::tl().open(c.stream[0]);
+    mqa::par_memcpy(hm + off_q, q.data_ptr(), q_bytes);
+    memcpy(hm + off_w, weights.data_ptr(), w_bytes);
+    // Q and the head weights always travel; block_tables and context_lens ride in the same
+    // buffer unless a resident pool owns them, in which case they have to land in the pool.
+    const bool meta_pool = mqa::resident_kv();
+    mqa::tl().begin(0, c.stream[0]);
+    CUDA_CHECK(cudaMemcpyAsync(dm, hm, meta_pool ? off_bt : meta_bytes,
+                               cudaMemcpyHostToDevice, c.stream[0]));
+    mqa::tl().end(c.stream[0]);
+    if (meta_pool && upload_kv) {
+        mqa::tl().begin(0, c.stream[0]);
+        CUDA_CHECK(cudaMemcpyAsync(dev_bt, hbt, bt_bytes, cudaMemcpyHostToDevice, c.stream[0]));
+        CUDA_CHECK(cudaMemcpyAsync(dev_cl, hcl, cl_bytes, cudaMemcpyHostToDevice, c.stream[0]));
+        mqa::tl().end(c.stream[0]);
     }
-    CUDA_CHECK(cudaEventRecord(c.meta_ready, c.stream[0]));
-    for (int i = 1; i < mqa::n_streams(); ++i)
-        CUDA_CHECK(cudaStreamWaitEvent(c.stream[i], c.meta_ready, 0));
+    // The event exists only to publish the above to the *other* streams. With a single chunk
+    // everything runs on stream[0] and the record + wait pair is 40 us of pure API tax.
+    if (multi_stream) {
+        CUDA_CHECK(cudaEventRecord(c.meta_ready, c.stream[0]));
+        for (int i = 1; i < mqa::n_streams(); ++i)
+            CUDA_CHECK(cudaStreamWaitEvent(c.stream[i], c.meta_ready, 0));
+    }
     pf.meta += get_clock_us() - t0;
 
     // ---- pipeline over batch chunks: gather(k+1) || H2D(k) || kernel(k) || D2H(k) ----
     const unsigned pages_x = (unsigned)ceil_div<int64_t>(max_model_len, block_size);
-    const size_t row_bytes = (size_t)max_model_len * sizeof(float);
     const int32_t *src_pages = c.src_pages.data();
     const char *kv_base = (const char *)kv_cache.data_ptr();
-    c.seg_bn0.clear(); c.seg_bnc.clear(); c.seg_live.clear();
+    c.seg_bn0.clear(); c.seg_bnc.clear(); c.seg_live.clear(); c.seg_off.clear();
+    int64_t out_off = 0;   // bytes claimed in the packed output buffer, master-only
 
     t0 = get_clock_us();
-    // Aim for ~2 chunks in flight per stream: enough to hide a gather behind the previous
-    // chunk's H2D + kernel, without paying launch overhead on tiny tiles.
-    // One kernel launch for the whole batch by default: the H2D slicing above already keeps
-    // the copy engine and the gather threads overlapped, and splitting the launch only adds
-    // per-chunk block waste (pages_used is a max over the chunk) plus launch overhead.
-    int64_t chunk_pages = mqa::chunk_pages_env();
-    if (chunk_pages <= 0) chunk_pages = total_pages > 0 ? total_pages : 1;
-    if (chunk_pages < 16) chunk_pages = 16;
-
     // One parallel region for the whole call: the gather is a worksharing loop per KV slice,
     // and the master thread issues that slice's H2D as soon as its barrier clears, so the DMA
     // for slice k overlaps the gather of slice k+1 without an OpenMP fork/join per slice.
-    #pragma omp parallel
+    #pragma omp parallel num_threads(mqa::host_threads())
     {
         int si = 0;
         for (int64_t b0 = 0; b0 < B;) {
@@ -588,8 +744,18 @@ inline void indexer_bf16_paged_mqa_logits(
 
             const int64_t p0 = c.page_begin[b0], p1 = c.page_begin[b1];
             if (upload_kv) {
-                const int64_t gp = mqa::gather_pages(total_pages);
-                for (int64_t q0 = p0; q0 < p1; q0 += gp) {
+                // Ramped slice schedule. The gather ahead of the *first* DMA is pure exposed
+                // latency (it is the bulk of the measured bubble on TC2: 0.32 of 0.63 ms), so
+                // that slice wants to be small; later slices want to be large, both because
+                // the copy engine only reaches full bandwidth on multi-MiB transfers (TC2 h2d
+                // busy: 10.95 ms at 64 pages/slice vs 9.77 at 512) and because every
+                // cudaMemcpyAsync costs ~20 us of API time under WSL2. Doubling from 1 MiB up
+                // to the adaptive cap gets both ends.
+                const int64_t gmax = mqa::gather_pages(total_pages);
+                const bool ramp = mqa::slice_ramp();
+                int64_t gp = !ramp || gmax < 64 ? gmax : 64;
+                for (int64_t q0 = p0; q0 < p1; q0 += gp,
+                     gp = !ramp ? gmax : (gp * 2 < gmax ? gp * 2 : gmax)) {
                     const int64_t q1 = q0 + gp < p1 ? q0 + gp : p1;
                     const double tg = get_clock_us();
                     #pragma omp for schedule(static)
@@ -599,10 +765,12 @@ inline void indexer_bf16_paged_mqa_logits(
                     #pragma omp master
                     {
                         t_gather += get_clock_us() - tg;
+                        mqa::tl().begin(0, s);
                         CUDA_CHECK(cudaMemcpyAsync((char *)dev_kv + (size_t)q0 * page_bytes,
                                                    (char *)c.h_kv + (size_t)q0 * page_bytes,
                                                    (size_t)(q1 - q0) * page_bytes,
                                                    cudaMemcpyHostToDevice, s));
+                        mqa::tl().end(s);
                     }
                 }
             }
@@ -618,38 +786,49 @@ inline void indexer_bf16_paged_mqa_logits(
                 int64_t pages_used = ceil_div<int64_t>(max_ctx, block_size);
                 if (pages_used > mnb) pages_used = mnb;
                 if (pages_used > (int64_t)pages_x) pages_used = (int64_t)pages_x;
+                // Only the first live columns of a row can be anything but -inf (for TC1 that
+                // is ~20% of it), so the kernel writes a packed [rows, live] block and the host
+                // writes the -inf tail while it copies the result out anyway. Packing did not
+                // speed up the copy itself (0.096 ms strided vs 0.089 ms contiguous for the
+                // same 0.25 MiB: it is latency, not bandwidth or per-row setup); it pays off
+                // under MQA_MAPOUT, where the same block is what the SMs push straight across
+                // PCIe, and contiguity across rows is what keeps those stores coalesced.
+                int64_t live = pages_used * block_size;
+                if (live > max_model_len) live = max_model_len;
+                mqa::tl().begin(1, s);
                 if (fast) {
                     const unsigned bx = (unsigned)ceil_div<int64_t>(pages_used, mqa::kPagesPerBlock);
                     mqa::mqa_logits_v4<<<dim3(bx, (unsigned)bnc), mqa::kThreads, 0, s>>>(
-                        (const __nv_bfloat16 *)c.d_q, (const __nv_bfloat16 *)dev_kv,
+                        (const __nv_bfloat16 *)(dm + off_q), (const __nv_bfloat16 *)dev_kv,
                         (const int32_t *)dev_bt, (const int32_t *)dev_cl,
-                        (const float *)c.d_w, (float *)c.d_out,
-                        (int)bn0, (int)next_n, (int)max_model_len, (int)pages_used, (int)mnb);
+                        (const float *)(dm + off_w), (float *)((char *)out_dev + out_off),
+                        (int)bn0, (int)next_n, (int)live, (int)pages_used, (int)mnb);
                 } else {
                     const int64_t tok_hi = pages_used * block_size;
                     const unsigned bx = (unsigned)ceil_div<int64_t>(tok_hi, mqa::kThreads / 32);
                     mqa::mqa_logits_generic<<<dim3(bx, (unsigned)bnc), mqa::kThreads, 0, s>>>(
-                        (const __nv_bfloat16 *)c.d_q, (const __nv_bfloat16 *)dev_kv,
+                        (const __nv_bfloat16 *)(dm + off_q), (const __nv_bfloat16 *)dev_kv,
                         (const int32_t *)dev_bt, (const int32_t *)dev_cl,
-                        (const float *)c.d_w, (float *)c.d_out,
+                        (const float *)(dm + off_w), (float *)((char *)out_dev + out_off),
                         (int)bn0, (int)next_n, (int)num_heads, (int)dim, (int)block_size,
-                        (int)max_model_len, (int)tok_hi, (int)mnb);
+                        (int)live, (int)tok_hi, (int)mnb);
                 }
                 CUDA_CHECK(cudaGetLastError());
+                mqa::tl().end(s);
 
-                // Only the first pages_used * block_size columns can be anything but -inf,
-                // and for TC1 that is ~20% of the row. Bring back just that prefix with a
-                // strided copy and let the host write the -inf tail while it is copying the
-                // result out anyway -- same host bytes, ~1.6 MiB less PCIe traffic per call.
-                int64_t live = pages_used * block_size;
-                if (live > max_model_len) live = max_model_len;
-                CUDA_CHECK(cudaMemcpy2DAsync((char *)c.h_out + (size_t)bn0 * row_bytes, row_bytes,
-                                             (char *)c.d_out + (size_t)bn0 * row_bytes, row_bytes,
-                                             (size_t)live * sizeof(float), (size_t)bnc,
-                                             cudaMemcpyDeviceToHost, s));
+                if (!mqa::map_out()) {
+                    mqa::tl().begin(2, s);
+                    CUDA_CHECK(cudaMemcpyAsync((char *)c.h_out + out_off,
+                                               (char *)c.d_out + out_off,
+                                               (size_t)bnc * live * sizeof(float),
+                                               cudaMemcpyDeviceToHost, s));
+                    mqa::tl().end(s);
+                }
                 c.seg_bn0.push_back(bn0);
                 c.seg_bnc.push_back(bnc);
                 c.seg_live.push_back(live);
+                c.seg_off.push_back(out_off);
+                out_off += (int64_t)bnc * live * (int64_t)sizeof(float);
             }
             b0 = b1;
         }
@@ -660,22 +839,25 @@ inline void indexer_bf16_paged_mqa_logits(
     t0 = get_clock_us();
     CUDA_CHECK(cudaDeviceSynchronize());
     pf.sync += get_clock_us() - t0;
+    mqa::tl().close();
     t0 = get_clock_us();
     {
         const int64_t nseg = (int64_t)c.seg_bn0.size();
         float *const odst = output.data_ptr();
-        const float *const osrc = (const float *)c.h_out;
+        const char *const osrc = (const char *)c.h_out;
         for (int64_t g = 0; g < nseg; ++g) {
             const int64_t bn0 = c.seg_bn0[g], bnc = c.seg_bnc[g], live = c.seg_live[g];
-            #pragma omp parallel for schedule(static)
+            const float *const src = (const float *)(osrc + c.seg_off[g]);
+            #pragma omp parallel for schedule(static) num_threads(mqa::host_threads())
             for (int64_t r = bn0; r < bn0 + bnc; ++r) {
                 float *d = odst + (size_t)r * max_model_len;
-                memcpy(d, osrc + (size_t)r * max_model_len, (size_t)live * sizeof(float));
+                memcpy(d, src + (size_t)(r - bn0) * live, (size_t)live * sizeof(float));
                 for (int64_t t = live; t < max_model_len; ++t) d[t] = -INFINITY;
             }
         }
     }
     pf.out += get_clock_us() - t0;
     pf.tick();
+    mqa::tl().tick();
     (void)bn_total;
 }

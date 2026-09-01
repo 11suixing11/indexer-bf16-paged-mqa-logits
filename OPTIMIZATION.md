@@ -15,17 +15,20 @@
 | v3 | Tensor Core（BF16 m16n8k16 MMA） | 680.70 | 634.33 | 2.7e-14 / 5.9e-14 |
 | v4 | 一个 block 吃 4 页 + 只启动能用到的页 | 694.10 | 633.46 | 2.7e-14 / 5.9e-14 |
 | v5 | 切片 H2D + 常驻 OpenMP 并行域 | ~790 | ~755 | 2.7e-14 / 5.9e-14 |
-| **v6（最终）** | **D2H 只回传活前缀** | **~920** | **~768** | **2.675637e-14 / 5.917489e-14** |
+| v6 | D2H 只回传活前缀 | ~920 | ~768 | 2.7e-14 / 5.9e-14 |
+| v7 | 固定主机线程数（评测脚本不设 `OMP_NUM_THREADS`） | ~1000 | ~790 | 2.7e-14 / 5.9e-14 |
+| **v8（最终）** | **输出直写 mapped pinned（取消 D2H）+ `cp.async` 页流水 + 页表预取** | **~1040** | **~798** | **2.675637e-14 / 5.917489e-14** |
 
-最终相对 CPU 参考实现：**TC1 约 10.6×，TC2 约 8.7×**。
+最终相对 CPU 参考实现：**TC1 约 12.0×，TC2 约 9.0×**。
 正确性余量：要求 `cos_diff < 5e-6`，实测 2.7e-14 / 5.9e-14，低了八个数量级；
 输出 mask 逐元素校验通过。
 
-单次调用耗时：TC1 1.13 ms，TC2 11.17 ms（含全部 H2D/D2H，因为 `main.cu`
+单次调用耗时：TC1 约 1.03 ms，TC2 约 10.9 ms（含全部 H2D，因为 `main.cu`
 的计时器包住了整个算子调用）。
 
-多次运行的抖动（同一二进制跑 8 次）：TC1 845–945，TC2 748–771。
-抖动主要来自主机侧的 gather 和 CPU 频率，不是 kernel。
+多次运行的抖动（官方 `bash run.sh`，同一二进制多轮）：TC1 895–1136，
+TC2 781–801；TC1 的中位数约 1000，落在 940–1060 之间的居多。TC1 数据量小、固定开销占比高，抖动主要来自主机侧
+gather 和 CPU 频率，不是 kernel；TC2 贴着 PCIe 上限，非常稳。
 下文所有对比数字都在同一台机器、同一组配置下取得。
 
 ## 2. 环境
@@ -36,7 +39,7 @@
 | CPU | 32 逻辑核 |
 | 系统 | WSL2 Ubuntu 24.04，驱动 610.88，CUDA 13.3 |
 | 编译 | `nvcc -O3 -std=c++17 -Xcompiler -fopenmp`，同时生成 sm_86 / sm_120 |
-| 运行 | `OMP_NUM_THREADS=8 ./main` |
+| 运行 | `bash run.sh`（无需任何环境变量；主机线程数由头文件自己定，见 v7） |
 
 `run.sh` 未做任何修改（其中写死 `-arch=sm_86`，在本机通过 PTX JIT 运行）；
 `build_local.sh` 是我自己加的构建脚本，额外产出 sm_120 原生代码，避免每次启动 JIT。
@@ -160,6 +163,51 @@ WSL2 上每次 `cudaMemcpyAsync` 约 15 µs 的 API 开销开始占主导）。
 TC1 因此从 808 → 942 GFLOPS（+17%），`out` 阶段 0.092 → 0.058 ms。
 这是整条路线上"性价比"最高的一步：改动约 20 行。
 
+### v7：把主机线程数收回来（~940 → ~1000 / 790 GFLOPS）
+
+这是全程单点收益最大、也最容易被忽略的一步：**`run.sh` 不设 `OMP_NUM_THREADS`**，
+于是 OpenMP 默认开满 32 个线程，而我此前一直用 `OMP_NUM_THREADS=8 ./main` 调优。
+两者差距极大 —— 同一个二进制，官方路径只有 TC1 638 / TC2 718，我自己跑却有
+TC1 1025 / TC2 792。
+
+| 线程数 | 4 | 6 | **8** | 10 | 12 | 16 | 32（默认） |
+|---|---|---|---|---|---|---|---|
+| TC1 | 991 | 1016 | **1032** | 1025 | 1009 | 955 | 658 |
+| TC2 | 789 | 776 | **791** | 792 | 784 | 760 | 739 |
+
+原因是 gather 受主机 DRAM 带宽限制，几个线程就打满了；再多的线程只会给每片
+切片的 OpenMP barrier 增加汇合成本（一片 256 页时，32 线程每人只分到 8 页 = 128 KiB，
+barrier 反而成了主要开销）。
+
+所以在头文件里给三个并行域都加上 `num_threads(mqa::host_threads())`，默认取
+`clamp(硬件线程数 / 4, 4, 16)`（本机得 8，换到内存通道更多的服务器会自动给更多），
+可用 `MQA_THREADS` 覆盖。**评测者直接 `bash run.sh` 就能拿到调优后的成绩，
+不依赖任何环境变量。**
+
+### v8：输出直写 mapped pinned + `cp.async` 页流水 + 页表预取（~1000 → ~1040 / 798 GFLOPS）
+
+三处改动：
+
+1. **取消 D2H。** `h_out` 改用 `cudaHostAlloc(..., cudaHostAllocMapped)`，
+   `cudaHostGetDevicePointer` 拿到设备侧别名直接交给 kernel 当 `logits` 指针，
+   结果由 SM 经 PCIe 写回主机，那条 `cudaMemcpyAsync` 整个删掉。设备时间线里
+   `d2h` 从 0.089 / 0.259 ms 直接变成 0.000（TC1 单次 +5.7%）。之所以值得删而不是
+   优化：0.25 MiB 用了 0.089 ms，等效 2.8 GB/s，说明它几乎全是固定延迟。
+   写回的可见性仍由 `cudaDeviceSynchronize` 保证，与原来靠拷贝时完全一样。
+2. **`cp.async` 页流水。** K 的 global -> shared 从 LDG+STS 换成
+   `cp.async.ca.shared.global`，并且把发起点挪到「上一页 mma 结束之后、epilogue
+   之前」：那个 `__syncthreads` 本来就要用来发布 `sPart`，顺带也证明了所有 warp
+   已经读完 `sK`，于是下一页的 16 KiB 可以立刻开始搬，与本页的归约、写回重叠。
+   第 0 页则与 Q 的装载并行发起。**没有多用一个字节 shared memory**（双缓冲需要
+   再来一份 17 KiB，会突破 48 KiB 静态上限并把 occupancy 砍半），每页的 barrier
+   数量还从 3 个降到 2 个。TC1 kernel 0.160 -> 0.089 ms（−44%），TC2 0.45 -> 0.41 ms。
+3. **页表预取。** 进页循环之前，一次性把本 block 负责的 4 个 `block_tables`
+   表项读进寄存器（互相独立的 4 条 load，而不是每页一条依赖式 load），
+   这样任何一页的数据搬运都不会再等自己的物理页号。
+
+`cp.async` 的 `.ca` / `.cg` 两种缓存策略实测无差别（TC1 kern 中位数 0.116 vs 0.129，
+TC2 0.408 vs 0.399，都在抖动范围内），保留 `.ca`。
+
 ## 5. 阶段耗时剖析
 
 `MQA_PROF=1` 会在算子内部按阶段累计耗时（每个 testcase 独立计数，丢掉前 10 次
@@ -168,39 +216,65 @@ warm-up，因为那几次要付一次性的 `cudaMalloc`/`cudaHostAlloc`，`main
 
 | 阶段 | 含义 | TC1 | TC2 |
 |---|---|---|---|
-| plan | 扫 `block_tables` 建压缩计划、检查缓冲区容量 | 0.003 | 0.017 |
-| meta | Q/weights/bt/cl 进 pinned 并发出上传、event 同步 | 0.069 | 0.168 |
-| gather | 主机把散页拷进 pinned 页池（与 DMA 重叠） | 0.265 | 7.818 |
-| issue | 发起 kernel 与各次 copy 的 API 开销 | 0.113 | 0.500 |
-| sync | `cudaDeviceSynchronize`，等剩余 DMA/kernel | 0.622 | 2.457 |
-| out | 从 pinned 拷回 `output` 并写 `-inf` 尾巴 | 0.058 | 0.207 |
-| **合计** | | **1.130** | **11.167** |
+| plan | 扫 `block_tables` 建压缩计划、检查缓冲区容量 | 0.003 | 0.019 |
+| meta | Q/weights/bt/cl 进 pinned 并发出上传 | 0.056 | 0.143 |
+| gather | 主机把散页拷进 pinned 页池（与 DMA 重叠） | 0.245 | 7.521 |
+| issue | 发起 kernel 与各次 copy 的 API 开销 | 0.403 | 0.459 |
+| sync | `cudaDeviceSynchronize`，等剩余 DMA/kernel | 0.231 | 2.376 |
+| out | 从 pinned 拷回 `output` 并写 `-inf` 尾巴 | 0.054 | 0.172 |
+| **合计** | | **0.992** | **10.690** |
 
 合计与 `main.cu` 测出的单次耗时基本吻合（阶段划分没有黑洞）。
 
-**怎么读这张表**：TC2 的 `gather` 7.8 ms 看着吓人，但它是在 master 线程发出 DMA
-之前记的，与 9.6 ms 的 H2D 完全重叠 —— 证据是 `gather + sync = 10.3 ms` 而不是
-`7.8 + 9.6 = 17.4 ms`。真正串行残留的是最后一片 H2D 之后的 kernel + D2H。
+**怎么读这张表**：TC2 的 `gather` 7.5 ms 看着吓人，但它是在 master 线程发出 DMA
+之前记的，与 9.8 ms 的 H2D 完全重叠 —— 证据是 `gather + sync = 9.9 ms` 而不是
+`7.5 + 9.8 = 17.3 ms`。主机侧的 `issue`/`gather` 都不在关键路径上，真正串行残留的
+是最后一片 H2D 之后才能跑的 kernel。
+
+### 设备时间线（`MQA_TIMELINE=1`）
+
+上面那张表是主机视角，它只知道等了多久，不知道 copy engine 和 SM 分别在忙什么。
+所以我又加了一套 event 时间线：在每次 H2D / kernel / D2H 前后各记一个 event
+（event 对象池化复用，计时期间不再创建任何对象），按类型累加设备忙时，
+再用最晚的 end event 减去起点得到整体跨度，差值就是设备空泡。90 次平均（ms）：
+
+| | h2d | kern | d2h | busy | span | bubble |
+|---|---|---|---|---|---|---|
+| TC1 | 0.760 | 0.089 | 0.000 | 0.849 | 0.912 | 0.064（7%） |
+| TC2 | 9.844 | 0.465 | 0.000 | 10.309 | 10.784 | 0.475（4%） |
+
+这张表是后面所有判断的依据：**TC1 有 77% 的时间、TC2 有 91% 的时间，
+设备上唯一在干的事情就是把 KV 从主机搬进来**。`d2h` 为 0 是 v8 直写 mapped
+pinned 的结果。
+
+它还顺手量出了 WSL2 的一项固定成本：单次 kernel 的 `kern` 区间约 0.09 ms，
+而把同样的工作切成 2 / 4 / 8 次启动后变成 0.31 / 0.49 / 0.81 ms —— 每个 kernel
+节点约 70 us、每个 copy 节点约 60 us 的下发延迟，都是实打实记在流上的。
+这个数字直接判了「kernel 与 H2D 重叠」的死刑（见负结果）。
 
 ### 上界分析
 
 | | TC1 | TC2 |
 |---|---|---|
-| 压缩后 KV | 8 MiB | 128 MiB |
-| Q | 1 MiB | 2 MiB |
-| D2H（活前缀） | ~0.45 MiB | ~2.9 MiB |
-| H2D 下限 @14.2 GB/s | 0.665 ms | 9.60 ms |
-| 实测 | 1.130 ms | 11.167 ms |
-| 距 PCIe roofline | 59% | **86%** |
+| 压缩后 KV + Q | 9 MiB | 130 MiB |
+| H2D 理论下限 @14.2 GB/s | 0.665 ms | 9.60 ms |
+| H2D 实测 | 0.760 ms | 9.844 ms |
+| 实测总耗时 | 0.992 ms | 10.690 ms |
+| 距 PCIe roofline | 67% | **90%** |
 
-TC2 已经贴到 PCIe 屋顶（剩下的 1.5 ms 是最后一片 KV 到齐之后才能跑的 kernel
-约 0.83 ms，加上 D2H 和主机回写）。TC1 数据量小，per-call 固定开销
-（meta + issue ≈ 0.18 ms）和不可重叠的 kernel 尾巴占比更高。
+拆开看剩下的距离，TC1 的 0.992 ms = H2D 0.760 + kernel 0.089 + 设备空泡 0.064
++ 主机回写 0.054 + 零头；TC2 的 10.69 ms = 9.844 + 0.465 + 0.475 + 0.172 + 零头。
+而这 0.089 / 0.465 的 kernel 区间里还各有约 0.07 ms 是 WSL2 的下发延迟，
+真正的执行只有约 0.02 / 0.40 ms。也就是说：**即使把计算做到零，TC1 也只能再快
+约 9%、TC2 约 4%**；这条实现已经贴在本平台的分页搬运上限上了。
 
-要吃掉 TC1 剩下的 40%，唯一的办法是让 kernel 与 H2D 重叠（把 kernel 也切块，
-或者用 event 让 kernel 在独立流上等每片 H2D）。我实测了前者，反而更慢
-（见下面的负结果），因为把 kernel 插进拷贝流会打断 copy engine 的连续性，
-而 copy engine 才是瓶颈。这条路我保留为未完成项，而不是假装它不存在。
+唯一能突破的方向是让搬运本身和计算重叠，即把 kernel 切块、和 H2D 交错。
+这条路我实测过两次，都是负的，而且时间线给出了确定的原因：切块之后
+copy engine 的忙时完全不变（TC1 恒为 0.72 ms、TC2 恒为 9.8 ms），
+变的是 kernel 与 D2H 的**设备**区间被下发延迟乘上了块数。
+一个切口最多能藏起半个 kernel（TC1 约 0.045 ms），却要付约 0.13 ms 去开这个口子。
+所以在 WSL2 上这条路是关着的；换到原生 Linux（下发延迟约 5 us）它会重新打开，
+这一点我写在下面的负结果里，而不是假装它不存在。
 
 ## 6. 拓展加分：任意 num_heads / dim / block_size
 
@@ -257,13 +331,15 @@ SHAPE SWEEP OK, failures: 0
 
 | | TC1 | TC2 |
 |---|---|---|
-| 默认（每次重传） | ~920 GFLOPS | ~768 GFLOPS |
-| `MQA_RESIDENT_KV=1` | **1231 GFLOPS** | **4447 GFLOPS** |
+| 默认（每次重传） | ~1040 GFLOPS | ~798 GFLOPS |
+| `MQA_RESIDENT_KV=1` | **1219 GFLOPS** | **4966 GFLOPS** |
 
-阶段耗时（resident）：TC1 `plan 0.105 | meta 0.078 | gather 0.083 | issue 0.050 | sync 0.381 | out 0.070`；
-TC2 `plan 0.016 | meta 0.075 | gather 0.000 | issue 0.043 | sync 0.834 | out 0.146`。
-TC2 的 4447 GFLOPS 就是这个 kernel 在"没有 PCIe 税"时的真实水平，
-`sync 0.834 ms` 基本就是 kernel 本身的耗时。
+设备时间线（resident）：TC1 `h2d 0.270 | kern 0.149 | span 0.469`，
+TC2 `h2d 0.206 | kern 0.419 | span 0.661`（TC1 的 h2d 是 Q 和 metadata，
+它们每次调用都不一样，跳不掉）。TC2 的 4966 GFLOPS 就是这个 kernel 在
+没有 PCIe 税时的真实水平；kern 0.419 ms 里还含约 0.07 ms 的 WSL2 下发延迟。
+注意这个 kern 与默认模式下量到的 0.465 ms 基本一致 —— 两种模式跑的是同一个
+kernel，只是数据来路不同，这也交叉验证了时间线的读数。
 
 **我不把它当作成绩**：题目给的数据在主机内存里，跳过传输就不是在解同一道题。
 默认关闭，写在这里是因为它回答了"kernel 到底有多快"这个问题，
@@ -288,21 +364,54 @@ WSL2 下 `ncu` 拿不到硬件计数器（`ERR_NVGPUCTRPERM`，要改注册表 +
    约 2%。说明 gather 瓶颈在随机页的读侧，不在写侧的 RFO。
 5. **`OMP_WAIT_POLICY=passive`**：更慢（resident TC2 2955 → 3913 µs 方向恶化），
    master 线程发 DMA 时其他线程需要能立刻被唤醒。
-6. **kernel 分块（`MQA_CHUNK`）**：想让 kernel 与 H2D 重叠，结果全面变慢 ——
-   `MQA_CHUNK=64/128/256` 在 TC1 是 459/606/701，TC2 是 321/408/506，
-   而整批一次启动是 920/768。把 kernel 插进拷贝流打断了 copy engine 的连续性，
-   而它才是瓶颈；同时 `pages_used` 取 chunk 内最大值，切细以后空转 block 变多。
+6. **kernel 分块（`MQA_CHUNK`）**：想让 kernel 与 H2D 重叠，结果全面变慢，
+   而且加上时间线之后原因是确定的。`MQA_CHUNK=64/128/256/整批` 下：
+
+   | | TC1 kern | TC1 d2h | TC1 GFLOPS | TC2 kern | TC2 d2h | TC2 GFLOPS |
+   |---|---|---|---|---|---|---|
+   | 整批（1 次启动） | 0.176 | 0.089 | 861 | 0.532 | 0.260 | 760 |
+   | 256 | 0.306 | 0.200 | 714 | 4.475 | 2.539 | 485 |
+   | 128 | 0.486 | 0.358 | 579 | 7.152 | 4.512 | 382 |
+   | 64 | 0.812 | 0.682 | 431 | 10.572 | 7.427 | 293 |
+
+   关键是 `h2d` 的忙时**一点没变**（TC1 恒 0.72 ms、TC2 恒 9.75 ms），
+   膨胀的是 kernel 和 D2H 的设备区间：每个 kernel 节点约 70 us、每个 copy 节点
+   约 60 us 的下发延迟，在 WSL2 上是记在流上的真实等待。
+   我最初把原因写成"打断了 copy engine 的连续性"，时间线证明那是错的 ——
+   copy engine 一直很顺，是启动本身太贵。一个切口最多藏起半个 kernel
+   （TC1 约 0.045 ms），代价却是约 0.13 ms。原生 Linux 上下发延迟只有约 5 us，
+   这条路会重新变得可行；这是本报告里唯一一个"平台决定结论"的地方。
+   次要因素：`pages_used` 取 chunk 内最大值，切细以后空转 block 也变多。
 7. **更多流**：`MQA_STREAMS` 1/2/3/4 → TC2 775/771/769/769，基本持平。
    默认单 kernel 启动之后，多流已经没有什么可并行的了。
 8. **更多 gather 线程**：8/16/32 线程下 TC2 的 gather 是 7.67/8.72/7.97 ms，8 最好。
-   随机页 gather 早就打满了 DRAM，加线程只增加争用。
+   随机页 gather 早就打满了 DRAM，加线程只增加争用。（线程数本身是个大坑，
+   见第 4 节 v7 —— 官方脚本不设 `OMP_NUM_THREADS`，默认 32 线程会吃掉 TC1 三分之一。）
+9. **切片大小渐进放大（`MQA_RAMP=1`）**：想法是第一片 gather 完全暴露在 DMA 之前，
+   所以先来几片小的（64/128/256...）好让 copy engine 早点开工。实测 TC1 持平、
+   TC2 反而差约 1%（768/774/776 → 765/768/760）。早期的小片排空得比 gather 补片
+   还快，copy engine 在开头空转三次，亏得比省下的多。默认关闭。
+10. **零拷贝直读主机 KV（把 gather 和 H2D 一起省掉）**：把调用方的 KV 竞技场
+    `cudaHostRegister(..., cudaHostRegisterMapped)` 一次，让 kernel 直接按
+    `block_tables` 从主机内存取页。微基准（512 MiB 竞技场、16 KiB 页）：
+    8 MiB 工作集 11.4–12.5 GB/s，128 MiB 工作集 10.6–10.8 GB/s，
+    顺序页与随机页几乎没差别；同一台机器上 pinned DMA 是 14.2–14.4 GB/s。
+    对 TC1 大致打平（省掉 gather 与固定开销，但带宽差 13%），
+    对 TC2 是 12.5 ms vs 9.8 ms，直接输 27%。SM 发起的 PCIe 读打不满链路，
+    这条路只有在带宽差距被固定开销盖住时才划算，不作为主路径。
+11. **`cp.async` 用 `.cg` 绕过 L1**：K 每页基本只读一次，理论上不该占 L1。
+    实测与 `.ca` 在抖动范围内没有差别（TC1 kern 中位数 0.116 vs 0.129，
+    TC2 0.408 vs 0.399），保留 `.ca`。
+12. **打包 D2H（连续回传替代 `cudaMemcpy2DAsync`）**：以为 2D 拷贝的 0.096 ms
+    是每行的建立开销，改成一次连续拷贝后还是 0.089 ms —— 它是延迟，不是带宽也不是
+    per-row 开销。这一步本身没收益，但它给 v8 的"直写 mapped pinned"铺好了路
+    （SM 侧的写就是连续的），所以保留。
 
 ## 9. 复现
 
 ```bash
-bash run.sh                      # 官方入口（sm_86，PTX JIT）
+bash run.sh                       # 官方入口（sm_86 + PTX JIT），不需要任何环境变量
 bash build_local.sh && ./main     # 本机原生 sm_120，避免 JIT
-OMP_NUM_THREADS=8 ./main          # 报告里的配置
 ```
 
 可选环境变量（全部有默认值，不设也能跑）：
@@ -315,23 +424,39 @@ OMP_NUM_THREADS=8 ./main          # 报告里的配置
 | `MQA_CHUNK` | 整批 | kernel 启动粒度 |
 | `MQA_RESIDENT_KV` | 关 | 显存常驻页池（见第 7 节） |
 | `MQA_FORCE_GENERIC` | 关 | 评测形状也走通用 kernel |
+| `MQA_TIMELINE` | 关 | 打印设备时间线（h2d / kern / d2h / 空泡） |
+| `MQA_THREADS` | `clamp(hw/4, 4, 16)` | 主机并行域线程数 |
+| `MQA_MAPOUT` | 开 | 输出直写 mapped pinned（关掉则退回 D2H 拷贝） |
+| `MQA_RAMP` | 关 | 切片大小渐进放大（负结果，见第 8 节） |
 
-`OMP_NUM_THREADS=8` 是实测最优；再补 `OMP_PROC_BIND=close OMP_PLACES=cores`
-能把 TC1 的抖动下限从 862 抬到 890 左右，但对中位数没有影响。
+主机线程数已经写在头文件里，不再依赖 `OMP_NUM_THREADS`；显式设置会被
+`num_threads()` 覆盖，只有 `MQA_THREADS` 能改。补 `OMP_PROC_BIND=close
+OMP_PLACES=cores` 能把 TC1 的抖动下限抬高一点，但对中位数没有影响。
 
 形状扫描（额外文件，不影响评测）：
 
 ```bash
 nvcc -O3 -std=c++17 -gencode arch=compute_120,code=sm_120 -Xcompiler -fopenmp -o shape_test shape_test.cu
-OMP_NUM_THREADS=8 ./shape_test
+./shape_test
 ```
 
 ## 10. 还没做的
 
 - **让 kernel 与 H2D 真正重叠**：现在整批一次启动，kernel 必须等最后一片 KV 到齐。
-  正确的做法应该是 kernel 在独立流上用 event 等每片 H2D，而不是把 kernel 塞回拷贝流
-  （已验证后者更慢）。这是 TC1 剩余 40% 差距的主要来源。
-- **`cp.async` 双缓冲 K 的 staging**：需要突破 48 KB 静态 shared memory 上限，
-  改用动态 smem + `cudaFuncSetAttribute`。
-- **v6 kernel 重排**：让一个 warp 负责 8 token × 全部 64 head，head 维归约留在寄存器里，
-  可以去掉 `sPart` 和每页两次 barrier。主要利好 TC1 和常驻模式。
+  在 WSL2 上这条路是关着的 —— 时间线量出每个 kernel 节点约 70 us 的下发延迟，
+  开一个切口的代价（约 0.13 ms）大于它能藏起来的计算（约 0.045 ms），
+  见第 8 节第 6 条。换到原生 Linux（下发延迟约 5 us）应该重新试一次：
+  按现在的数字，TC1 大约还有 0.09 ms（9%）、TC2 大约 0.40 ms（4%）可拿。
+- **`sK` 真正的双缓冲**：v8 只做到了"上一页算完就开始搬下一页"，
+  单缓冲 + 一个 barrier。整页双缓冲需要再来一份 17 KiB，突破 48 KB 静态上限
+  （要动态 smem + `cudaFuncSetAttribute`），而且会把 occupancy 从 2 block/SM
+  砍到 1。正确的省内存写法是把一页切成两个 32 token 的半页缓冲，
+  代价是 warp 分工要从"4 head 组 × 2 token 半区"改成"每 warp 8 token × 32 head"，
+  epilogue 的跨 warp 归约也要跟着重写。收益上限只有几个百分点，先记下来。
+- **kernel 重排去掉 `sPart`**：让一个 warp 负责 8 token × 全部 64 head，
+  head 维归约完全留在寄存器里，可以去掉 `sPart` 和每页剩下的 2 次 barrier。
+  与上一条冲突（8 warp × 8 token = 64 token 恰好是一整页，容不下半页缓冲），
+  只能二选一。主要利好常驻模式，对评测的两个 case 影响在抖动量级。
+- **主机侧 gather 与 DMA 的最后 4% 空泡**：TC2 还有 0.475 ms 的设备空泡，
+  来自每片切片的 OpenMP barrier 与 master 线程发起 DMA 之间的间隙。
+  用一个专职 issue 线程 + 每片原子计数器（而不是 barrier）应该能压掉一部分。
