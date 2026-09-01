@@ -1,4 +1,5 @@
 main
 main_ref
-main_v1
+main_v*
+shape_test
 *.ncu-rep
