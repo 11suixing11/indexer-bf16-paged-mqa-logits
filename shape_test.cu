@@ -32,6 +32,13 @@ static const Shape kShapes[] = {
     { 32, 128, 128, 16, 3, 2048, 1024, "block 128, next_n 3" },
     { 64, 128,  64, 16, 4, 2048,  700, "next_n 4" },
     { 64, 100,  64,  8, 1, 2048, 1024, "dim 100 -> CPU ref fallback" },
+    { 64, 128,  64,  1, 2, 2048, 1024, "batch 1" },
+    { 64, 128,  64,  3, 1, 2048,  120, "batch 3, short ctx" },
+    { 64, 128,  64, 16, 2, 2000, 1900, "mml 2000 % 64 != 0 (partial tail block)" },
+    { 64, 128,  64,  8, 2,   40,   30, "mml 40 < block_size" },
+    { 64, 128,  64,  8, 2, 2048,    4, "ctx == next_n (single page)" },
+    { 64, 128,  64,  4, 1, 8192, 8000, "long ctx, 128 pages/seq" },
+    { 32,  64,  32,  5, 3, 1000,  950, "generic, mml 1000 / block 32" },
 };
 
 static bool run_shape(const Shape &sh)

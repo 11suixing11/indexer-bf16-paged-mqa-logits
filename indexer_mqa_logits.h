@@ -26,9 +26,13 @@
 #include <cuda_bf16.h>
 #include <iostream>
 #include <cstring>
+#if defined(__x86_64__) || defined(__i386__)
+#include <emmintrin.h>
+#endif
 #include <vector>
 #include <unordered_map>
 #include <omp.h>
+#include <unistd.h>
 
 #include "ref_mqa_logits.h"
 #include "allocator.h"
@@ -114,6 +118,26 @@ inline int host_threads() {
 inline bool map_out() { static bool v = env_int("MQA_MAPOUT", 1) != 0; return v; }
 inline bool force_generic() { static bool v = env_int("MQA_FORCE_GENERIC", 0) != 0; return v; }
 inline bool resident_kv() { static bool v = env_int("MQA_RESIDENT_KV", 0) != 0; return v; }
+// Last-level cache size, for the streaming-store decision below. sysconf reports the L3
+// of one package (32 MiB on this Ryzen 9 9955HX); if the platform will not say, assume a
+// small one, which only biases us towards streaming stores.
+inline size_t llc_bytes() {
+    static size_t v = 0;
+    if (v) return v;
+    long l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
+    if (l3 <= 0) l3 = 16L << 20;
+    v = (size_t)l3;
+    return v;
+}
+// Whether to gather with non-temporal stores. MQA_NTCOPY: -1 auto (default), 0 never,
+// 1 always. Auto compares the gather footprint -- the pages read plus the pinned copy
+// written -- against the LLC, because that is what decides the sign of the effect
+// (measured, both directions, in OPTIMIZATION.md section 8 item 14).
+inline bool nt_gather(size_t bytes) {
+    static int m = env_int("MQA_NTCOPY", -1);
+    if (m >= 0) return m != 0;
+    return 2 * bytes > llc_bytes();
+}
 
 // One dataset's device-side compacted KV pool, plus enough of a signature to notice that
 // the allocator handed the same address to different data.
@@ -541,6 +565,45 @@ inline void par_memcpy(void *dst, const void *src, size_t bytes)
     }
 }
 
+
+// Streaming stores for the gather. glibc only switches memcpy over to non-temporal stores
+// above x86_non_temporal_threshold (~3/4 of L3); a 16 KiB page copy stays on the ordinary
+// path, so every destination line is first *read* for ownership and written back later.
+// When the gather footprint dwarfs the LLC that is pure waste -- TC2 gathers 128 MiB into
+// 32 MiB of L3, and streaming the stores cuts its gather from 9.0 ms to 6.6 ms and, more
+// importantly, stops it from overrunning the 9.9 ms of H2D it has to hide under. When the
+// footprint *fits*, the ordinary path is strictly better: TC1's 8 MiB stay resident, the
+// copy engine snoops them out of cache, and forcing them to DRAM doubles its gather
+// (0.34 -> 0.73 ms) for no gain in h2d (0.79 vs 0.81 ms). Hence the LLC test, not a flag.
+inline void nt_page_copy(char *dst, const char *src, size_t n, bool nt)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    if (nt && ((((uintptr_t)dst | (uintptr_t)src | n) & 31) == 0)) {
+        const __m128i *s = (const __m128i *)src;
+        __m128i *d = (__m128i *)dst;
+        const size_t v = n / 16;
+        for (size_t i = 0; i < v; i += 2) {
+            const __m128i a = _mm_loadu_si128(s + i);
+            const __m128i b = _mm_loadu_si128(s + i + 1);
+            _mm_stream_si128(d + i, a);
+            _mm_stream_si128(d + i + 1, b);
+        }
+        return;
+    }
+#endif
+    memcpy(dst, src, n);
+}
+
+// Non-temporal stores are weakly ordered: the write-combining buffers have to be drained
+// before the copy engine is told to read them. One fence per thread per slice.
+inline void nt_fence()
+{
+#if defined(__x86_64__) || defined(__i386__)
+    _mm_sfence();
+#else
+    __sync_synchronize();
+#endif
+}
 }  // namespace mqa
 
 inline void indexer_bf16_paged_mqa_logits(
@@ -693,6 +756,7 @@ inline void indexer_bf16_paged_mqa_logits(
     if (chunk_pages <= 0) chunk_pages = total_pages > 0 ? total_pages : 1;
     if (chunk_pages < 16) chunk_pages = 16;
     const bool multi_stream = mqa::n_streams() > 1 && chunk_pages < total_pages;
+    const bool use_nt = mqa::nt_gather((size_t)total_pages * page_bytes);
 
     // ---- metadata + Q up front, in a single transfer ----
     mqa::tl().open(c.stream[0]);
@@ -758,10 +822,13 @@ inline void indexer_bf16_paged_mqa_logits(
                      gp = !ramp ? gmax : (gp * 2 < gmax ? gp * 2 : gmax)) {
                     const int64_t q1 = q0 + gp < p1 ? q0 + gp : p1;
                     const double tg = get_clock_us();
-                    #pragma omp for schedule(static)
+                    #pragma omp for schedule(static) nowait
                     for (int64_t i = q0; i < q1; ++i)
-                        memcpy((char *)c.h_kv + (size_t)i * page_bytes,
-                               kv_base + (size_t)src_pages[i] * page_bytes, page_bytes);
+                        mqa::nt_page_copy((char *)c.h_kv + (size_t)i * page_bytes,
+                                          kv_base + (size_t)src_pages[i] * page_bytes,
+                                          page_bytes, use_nt);
+                    mqa::nt_fence();
+                    #pragma omp barrier
                     #pragma omp master
                     {
                         t_gather += get_clock_us() - tg;

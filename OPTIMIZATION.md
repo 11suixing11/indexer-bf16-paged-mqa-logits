@@ -17,7 +17,8 @@
 | v5 | 切片 H2D + 常驻 OpenMP 并行域 | ~790 | ~755 | 2.7e-14 / 5.9e-14 |
 | v6 | D2H 只回传活前缀 | ~920 | ~768 | 2.7e-14 / 5.9e-14 |
 | v7 | 固定主机线程数（评测脚本不设 `OMP_NUM_THREADS`） | ~1000 | ~790 | 2.7e-14 / 5.9e-14 |
-| **v8（最终）** | **输出直写 mapped pinned（取消 D2H）+ `cp.async` 页流水 + 页表预取** | **~1040** | **~798** | **2.675637e-14 / 5.917489e-14** |
+| v8 | 输出直写 mapped pinned（取消 D2H）+ `cp.async` 页流水 + 页表预取 | ~1040 | ~798 | 2.7e-14 / 5.9e-14 |
+| **v9（最终）** | **gather 按 LLC 容量自动切换非临时存储（`_mm_stream_si128`）** | **持平（噪声内）** | **v8 +2.6% ~ +4.7%** | **2.675637e-14 / 5.917489e-14** |
 
 最终相对 CPU 参考实现：**TC1 约 12.0×，TC2 约 9.0×**。
 正确性余量：要求 `cos_diff < 5e-6`，实测 2.7e-14 / 5.9e-14，低了八个数量级；
@@ -29,7 +30,10 @@
 多次运行的抖动（官方 `bash run.sh`，同一二进制多轮）：TC1 895–1136，
 TC2 781–801；TC1 的中位数约 1000，落在 940–1060 之间的居多。TC1 数据量小、固定开销占比高，抖动主要来自主机侧
 gather 和 CPU 频率，不是 kernel；TC2 贴着 PCIe 上限，非常稳。
-下文所有对比数字都在同一台机器、同一组配置下取得。
+下文所有对比数字都在同一台机器、同一组配置下取得。v9 一行给的是相对值而不是绝对
+GFLOPS：这台机器上有别的任务在跑时 CPU 侧会整体掉一档（同一个 v9 二进制在忙/闲两种
+状态下 TC1 是 955 和 1122），跨版本比绝对值没有意义，所以 v9 的收益一律用「同一轮里
+交替跑两个二进制取中位数」的方式给出，见 §4 v9。
 
 ## 2. 环境
 
@@ -208,6 +212,73 @@ barrier 反而成了主要开销）。
 `cp.async` 的 `.ca` / `.cg` 两种缓存策略实测无差别（TC1 kern 中位数 0.116 vs 0.129，
 TC2 0.408 vs 0.399，都在抖动范围内），保留 `.ca`。
 
+### v9：gather 按缓存容量决定用不用非临时存储（TC2 +2.6% ~ +4.7%）
+
+到 v8，TC2 的设备时间线已经贴着 PCIe 上限（h2d busy 9.84 ms / 130 MiB ≈ 98% 峰值），
+剩下的唯一风险不在设备侧而在主机侧：**gather 必须完全躲在 H2D 底下**，一旦某个切片
+的 gather 慢了，`#pragma omp master` 就没法及时发出下一条 `cudaMemcpyAsync`，拷贝引擎
+空转。实测 v8 的 TC2 gather 是 9.04 ms（多轮区间 8.1–12.4 ms），而它要藏进 9.84 ms 的
+H2D 里 —— 中位数刚好卡在边界上，抖动的上半部分直接变成气泡。
+
+原因是这个 gather 的访存足迹超出了 LLC 一个量级：TC2 要读 128 MiB 的散列页、写 128 MiB
+的 pinned 中转区，合计 256 MiB，而这颗 9955HX 的 L3 只有 32 MiB（`sysconf(_SC_LEVEL3_CACHE_SIZE)`）。
+写侧每条 store 都要先把目标 cache line 读进来（read-for-ownership），而这份数据 CPU 之后
+一次都不会再读 —— 读它的是拷贝引擎。于是把页拷贝改成非临时存储：
+
+```cpp
+const __m128i a = _mm_loadu_si128(s + i);
+_mm_stream_si128(d + i, a);      // 绕过 cache，直接进 write-combining buffer
+```
+
+只用 SSE2（`_mm_stream_si128`），因为评测脚本的编译命令是固定的
+`nvcc -O3 -arch=sm_86 -std=c++17 -Xcompiler -fopenmp`，没有 `-mavx2`，而 SSE2 在
+x86-64 上是基线，不需要任何额外编译选项。glibc 的 `memcpy` 自己也有 NT 阈值
+（`x86_non_temporal_threshold`，约 3/4 L3），但它是**按单次调用**判断的：这里每次只拷
+一页 16 KiB，永远走不到那条分支，所以必须在外面自己判断整轮 gather 的总足迹。
+
+非临时存储是弱序的，WC buffer 必须在拷贝引擎去读之前排空，所以每个线程每个切片补一次
+`_mm_sfence()`；同时把 `#pragma omp for` 改成 `nowait` + 显式 `#pragma omp barrier`，
+让 fence 落在原来那道隐式 barrier 之前，`master` 发 `cudaMemcpyAsync` 时的可见性保证
+和改动前完全一样。
+
+**开关必须是双向的**，因为效果的符号跟着 LLC 命中率翻转（同一次测量）：
+
+| | v8（普通 store） | v9（非临时 store） |
+|---|---|---|
+| TC1 gather（足迹 2×8 MiB，能装进 32 MiB L3） | 0.343 ms | **0.732 ms（更差一倍）** |
+| TC2 gather（足迹 2×128 MiB，装不进） | 9.04 ms | **6.61 ms（−27%）** |
+| TC1 / TC2 h2d busy | 0.79 / 9.92 ms | 0.81 / 9.90 ms（不变） |
+
+TC1 的足迹本来就在 L3 里，pinned 中转区写完马上被拷贝引擎读走，命中的是 L3 而不是内存；
+强行绕过 cache 等于把一次 L3 命中换成一次内存往返，所以慢一倍。h2d busy 两边都不变，
+说明这个改动**完全没有影响 PCIe 侧**，收益的唯一来源就是 gather 的墙上时间不再溢出
+H2D 的窗口，TC2 的 gather 区间从 8.1–12.4 ms 收窄到 6.4–6.7 ms。
+
+因此判据直接写成足迹和 LLC 的比较（`MQA_NTCOPY=-1` 自动，0/1 强制）：
+
+```cpp
+inline bool nt_gather(size_t bytes) {          // bytes = total_pages * page_bytes
+    static int m = env_int("MQA_NTCOPY", -1);
+    if (m >= 0) return m != 0;
+    return 2 * bytes > llc_bytes();            // 读 + 写两份足迹
+}
+```
+
+TC1（16 MiB < 32 MiB）留在普通 `memcpy`，TC2（256 MiB > 32 MiB）走非临时；
+`sysconf` 拿不到 L3 时按 16 MiB 保守假设，只会更倾向于开启。
+非 32 字节对齐 / 长度不是 32 倍数的页形状自动退回 `memcpy`（`nt_page_copy` 里的守卫），
+所以拓展加分的任意 `dim`、`block_size` 不受影响。
+
+交替 A/B（同一台机器、同一轮里交替跑 v8 和 v9 的两个二进制，取中位数）：
+
+| 轮次 | TC1 v8 → v9 | TC2 v8 → v9 |
+|---|---|---|
+| 11 轮（机器上有背景负载） | 962 → 967 | **750 → 785（+4.7%）**，min 700 → 770 |
+| 9 轮（背景负载退去后） | 936 → 955 | **767 → 787（+2.6%）** |
+
+TC1 的差异在它自己 ±15% 的抖动里，且 TC1 走的本来就是原来那条 `memcpy` 分支，视作持平；
+TC2 两轮同向，9 轮那组里 v9 的 9 个值有 8 个高于 v8 的全部 9 个值。
+
 ## 5. 阶段耗时剖析
 
 `MQA_PROF=1` 会在算子内部按阶段累计耗时（每个 testcase 独立计数，丢掉前 10 次
@@ -230,6 +301,12 @@ warm-up，因为那几次要付一次性的 `cudaMalloc`/`cudaHostAlloc`，`main
 之前记的，与 9.8 ms 的 H2D 完全重叠 —— 证据是 `gather + sync = 9.9 ms` 而不是
 `7.5 + 9.8 = 17.3 ms`。主机侧的 `issue`/`gather` 都不在关键路径上，真正串行残留的
 是最后一片 H2D 之后才能跑的 kernel。
+
+`gather` 那一行是 v9 之前的数（这张表是在安静的机器上取的）。v9 的非临时存储把 TC2
+的 gather 又压下去一截：同一次测量里 v8 是 9.04 ms、v9 是 6.61 ms，区间从 8.1–12.4
+收窄到 6.4–6.7；TC1 保持普通 `memcpy`，这一行不变。这件事的意义不在「gather 变快了」
+（它本来就重叠在 H2D 底下），而在**它的上界终于稳稳低于 H2D 的 9.8 ms**，不会再偶尔
+顶出去让拷贝引擎空转 —— 见 §4 v9。
 
 ### 设备时间线（`MQA_TIMELINE=1`）
 
@@ -268,6 +345,10 @@ pinned 的结果。
 真正的执行只有约 0.02 / 0.40 ms。也就是说：**即使把计算做到零，TC1 也只能再快
 约 9%、TC2 约 4%**；这条实现已经贴在本平台的分页搬运上限上了。
 
+另一个方向是**少搬字节**：让 H2D 只传 fp8/int8 的 K，直接把 9.84 ms 砍一半。
+它被题目的精度门槛封死了 —— bf16 的尾数少一位，`cos_diff` 就从 5.9e-14 跳到
+7.8e-6，超过 5e-6 的上限，见第 8 节第 18 条。
+
 唯一能突破的方向是让搬运本身和计算重叠，即把 kernel 切块、和 H2D 交错。
 这条路我实测过两次，都是负的，而且时间线给出了确定的原因：切块之后
 copy engine 的忙时完全不变（TC1 恒为 0.72 ms、TC2 恒为 9.8 ms），
@@ -294,22 +375,29 @@ Tensor Core kernel 是针对 `num_heads=64, dim=128, block_size=64` 特化的
 约束：`dim % 32 == 0 && dim <= 512`。超出这个范围（例如 `dim = 100`）才回落到 CPU 参考实现。
 
 验证用 `shape_test.cu`（我自己加的文件，不修改任何原有文件），逐形状与
-`ref_bf16_paged_mqa_logits<double>` 对比，13 组全部通过：
+`ref_bf16_paged_mqa_logits<double>` 对比（同时逐元素校验 mask），20 组全部通过：
 
 ```
-PASS heads= 64 dim= 128 block=  64 next_n=2  cos_diff=2.898e-14   (graded shape, fast path)
-PASS heads= 32 dim= 128 block=  64 next_n=2  cos_diff=8.327e-15   (fewer heads)
-PASS heads=128 dim= 128 block=  64 next_n=1  cos_diff=1.144e-14   (more heads)
-PASS heads=  1 dim= 128 block=  64 next_n=1  cos_diff=3.886e-15   (single head)
-PASS heads= 64 dim=  32 block=  64 next_n=1  cos_diff=4.219e-15   (dim 32, 1 elem/lane)
-PASS heads= 64 dim=  64 block=  64 next_n=2  cos_diff=1.021e-14   (dim 64)
-PASS heads= 32 dim= 256 block=  64 next_n=1  cos_diff=6.328e-15   (dim 256)
-PASS heads= 16 dim= 512 block=  64 next_n=1  cos_diff=6.217e-15   (dim 512, 16 elem/lane)
-PASS heads= 40 dim=  96 block=  48 next_n=2  cos_diff=9.548e-15   (dim 96, block 48, 非 2 的幂)
-PASS heads= 64 dim= 128 block=  16 next_n=1  cos_diff=9.215e-15   (block 16)
-PASS heads= 32 dim= 128 block= 128 next_n=3  cos_diff=7.994e-15   (block 128, next_n 3)
-PASS heads= 64 dim= 128 block=  64 next_n=4  cos_diff=3.231e-14   (next_n 4)
-PASS heads= 64 dim= 100 block=  64 next_n=1  cos_diff=1.055e-14   (dim 100 -> CPU ref 回落)
+PASS  heads= 64 dim= 128 block=  64 next_n=2 mask=ok cos_diff=2.898e-14   (graded shape (fast path))
+PASS  heads= 32 dim= 128 block=  64 next_n=2 mask=ok cos_diff=8.327e-15   (fewer heads)
+PASS  heads=128 dim= 128 block=  64 next_n=1 mask=ok cos_diff=1.144e-14   (more heads)
+PASS  heads=  1 dim= 128 block=  64 next_n=1 mask=ok cos_diff=3.886e-15   (single head)
+PASS  heads= 64 dim=  32 block=  64 next_n=1 mask=ok cos_diff=4.219e-15   (dim 32 (1 elem/lane))
+PASS  heads= 64 dim=  64 block=  64 next_n=2 mask=ok cos_diff=1.021e-14   (dim 64)
+PASS  heads= 32 dim= 256 block=  64 next_n=1 mask=ok cos_diff=6.328e-15   (dim 256)
+PASS  heads= 16 dim= 512 block=  64 next_n=1 mask=ok cos_diff=6.217e-15   (dim 512 (16 elem/lane, max))
+PASS  heads= 40 dim=  96 block=  48 next_n=2 mask=ok cos_diff=9.548e-15   (dim 96, block 48 (non-pow2))
+PASS  heads= 64 dim= 128 block=  16 next_n=1 mask=ok cos_diff=9.215e-15   (block 16)
+PASS  heads= 32 dim= 128 block= 128 next_n=3 mask=ok cos_diff=7.994e-15   (block 128, next_n 3)
+PASS  heads= 64 dim= 128 block=  64 next_n=4 mask=ok cos_diff=3.231e-14   (next_n 4)
+PASS  heads= 64 dim= 100 block=  64 next_n=1 mask=ok cos_diff=1.055e-14   (dim 100 -> CPU ref fallback)
+PASS  heads= 64 dim= 128 block=  64 next_n=2 mask=ok cos_diff=1.721e-14   (batch 1)
+PASS  heads= 64 dim= 128 block=  64 next_n=1 mask=ok cos_diff=1.577e-14   (batch 3, short ctx)
+PASS  heads= 64 dim= 128 block=  64 next_n=2 mask=ok cos_diff=3.064e-14   (mml 2000 % 64 != 0 (partial tail block))
+PASS  heads= 64 dim= 128 block=  64 next_n=2 mask=ok cos_diff=1.343e-14   (mml 40 < block_size)
+PASS  heads= 64 dim= 128 block=  64 next_n=2 mask=ok cos_diff=1.632e-14   (ctx == next_n (single page))
+PASS  heads= 64 dim= 128 block=  64 next_n=1 mask=ok cos_diff=2.620e-14   (long ctx, 128 pages/seq)
+PASS  heads= 32 dim=  64 block=  32 next_n=3 mask=ok cos_diff=7.550e-15   (generic, mml 1000 / block 32)
 SHAPE SWEEP OK, failures: 0
 ```
 
@@ -363,7 +451,9 @@ WSL2 下 `ncu` 拿不到硬件计数器（`ERR_NVGPUCTRPERM`，要改注册表 +
 4. **gather 用 AVX2 非临时存储（`_mm256_stream_si256`）**：6.65–6.86 ms vs 6.81–6.97 ms，
    约 2%。说明 gather 瓶颈在随机页的读侧，不在写侧的 RFO。
 5. **`OMP_WAIT_POLICY=passive`**：更慢（resident TC2 2955 → 3913 µs 方向恶化），
-   master 线程发 DMA 时其他线程需要能立刻被唤醒。
+   master 线程发 DMA 时其他线程需要能立刻被唤醒。v8 上再量一次，差距大得离谱：
+   TC1 951 → 371 GFLOPS、TC2 725 → 682（3 轮中位数）。每片一次 futex 睡眠/唤醒
+   比 barrier 自旋贵一个量级，这也是第 13 条"barrier 本身不贵"的反证。
 6. **kernel 分块（`MQA_CHUNK`）**：想让 kernel 与 H2D 重叠，结果全面变慢，
    而且加上时间线之后原因是确定的。`MQA_CHUNK=64/128/256/整批` 下：
 
@@ -406,6 +496,98 @@ WSL2 下 `ncu` 拿不到硬件计数器（`ERR_NVGPUCTRPERM`，要改注册表 +
     是每行的建立开销，改成一次连续拷贝后还是 0.089 ms —— 它是延迟，不是带宽也不是
     per-row 开销。这一步本身没收益，但它给 v8 的"直写 mapped pinned"铺好了路
     （SM 侧的写就是连续的），所以保留。
+13. **专职 issue 线程 + 每片原子计数器（替掉每片的 OpenMP barrier）**：
+    第 10 节原来把 TC2 剩下的设备空泡记在"barrier 清空到 master 线程发起 DMA 之间的
+    间隙"上，于是照着做了一版：调用一开始先把切片计划（chunk / slice / grain）算出来，
+    团队开到 `host_threads() + 1`，0 号线程只负责发射 —— 自旋等 `done[slice]` 原子
+    计数器到齐就发这一片的 `cudaMemcpyAsync`，一个 chunk 的最后一片过去之后启动 kernel；
+    其余 8 个线程从一个全局原子游标上抢 grain 做 gather，谁都不在 barrier 上等。
+    发射顺序仍然由单线程按计划顺序给出，所以流内"H2D 先于 kernel"的约束没有变化。
+    11 轮交替测量（中位数，GFLOPS）：
+
+    | | TC1 | TC2 |
+    |---|---|---|
+    | barrier（默认） | 1053 | 780 |
+    | 专职 issue 线程（9 线程） | 852 | 761 |
+    | 专职 issue 线程（`MQA_THREADS=7`，共 8 线程） | 880 | 771 |
+
+    grain 扫过 2/4/8/16/32 页，8 页最好（TC1 833/811/882/843/806，
+    TC2 754/760/774/767/698），但最好的一档仍然比 barrier 慢约 16%。
+    阶段计时说清了原因，而且两个 case 的原因不一样：
+
+    - TC1：gather 的墙上时间确实降了（0.453 → 0.300 ms），可是 issue 从 0.106 涨到
+      0.464 ms —— 同样 9 次 API 调用，每次从约 12 µs 变成约 51 µs。WSL2 的提交路径
+      自己要写命令缓冲，8 个 gather 线程正把 DRAM 打满的时候它就变慢。重叠没有消掉
+      空泡，只是把空泡从 gather 挪到了 issue，而且挪贵了。
+    - TC2：issue 线程的自旋时间是 8.09 ms，整个调用才约 10.6 ms —— 它几乎一直在等页，
+      根本不是被 barrier 拦住的。也就是说 TC2 的设备空泡本来就是 gather 自己
+      （7.7–9.0 ms 的 gather 对 9.8 ms 的 H2D，再加上第一片完全暴露在 DMA 之前），
+      第 10 节把它归因给 barrier 是错的。每片 barrier 的实际成本是自旋等待级别，
+      不是一次 futex 往返 —— 第 5 条从反面证实了这一点。
+
+    结论：`omp for schedule(static)` 对这个规则得不能再规则的循环已经是最优解，
+    动态 grain 只增加争用。代码已回退，不留开关。
+
+14. **零拷贝再测一遍，这次连注册开销一起算（收束第 3、10 条）**：v9 之前又写了一个
+    更接近真实 kernel 的微基准 —— 用 `cp.async.ca.shared.global` 从 mapped 主机内存
+    按页取 K（和正式 kernel 同一条指令、同一种访问形状），而不是简单的 `ld.global`：
+
+    | 工作集 | 零拷贝 in-kernel 读 | 同机 pinned DMA |
+    |---|---|---|
+    | 8 MiB（≈TC1） | 13.34 GB/s | 14.3 GB/s |
+    | 32 MiB | 11.70 GB/s | 14.3 GB/s |
+    | 128 MiB（≈TC2） | 10.93 GB/s | 14.3 GB/s |
+
+    比第 10 条的旧数好一点，TC1 那一档甚至可能是赢的（少 13% 带宽，但省掉整个 gather
+    和一半固定开销）。真正判死它的是注册开销：`cudaHostRegister(..., cudaHostRegisterMapped)`
+    256 MiB 实测 **180.1 ms，等效 1.49 GB/s**（第 3 条测的是不带 mapped 的注册，快得多，
+    mapped 要建设备侧页表，是另一个量级）。而评测 harness 每次调用换一个 KV 竞技场、
+    在约 1.9 GB 的不同缓冲区上循环，注册没法复用，摊到每次调用约 13 ms —— 比它想省掉的
+    9.8 ms 传输还贵。这条路彻底关掉，不留开关。
+15. **多流 H2D 在硬件层面就不可能有收益（收束第 7 条）**：第 7 条只是端到端量了
+    `MQA_STREAMS` 没差别，没说清为什么。写了个纯拷贝微基准：把 128 MiB 拆到 1/2/3/4
+    条流上并发上传，得到 14.0 / 14.4 / 14.2 / 14.1 GB/s —— 完全不动。原因是
+    `cudaDeviceProp::asyncEngineCount == 1`：这颗卡只有一个拷贝引擎，多少条流最终都排
+    到同一个队列上。默认 `MQA_STREAMS=2` 保留，因为它不花钱，而且换到有两个拷贝引擎
+    的卡上（多数数据中心卡是 2 甚至 5）就能自动吃到收益。
+16. **两个已经在最优点上的参数，重新扫了一遍确认**：
+    - `MQA_GCHUNK`（H2D 切片的页数，默认 `clamp(total_pages/24, 64, 512)`）：TC1 落在
+      64 页 = 1 MiB，TC2 落在 341 页 = 5.3 MiB。手工扫 32/64/128/256/512/1024 页，
+      两个 case 的最好值都正好是启发式给出的那一档（TC1 太小就被第 2 条的 API 开销吃掉，
+      太大则第一片暴露得太久；TC2 反过来，太小就发不过来）。启发式不改。
+    - `kPagesPerBlock = 4`（一个 block 吃几页）：1/2/4/8 页的 kernel 时间是
+      0.121 / 0.098 / 0.089 / 0.094 ms（TC1），4 是最优；8 页时 shared memory 压住了
+      occupancy。不改。
+    - 主机 gather 线程数 6 vs 8（默认 `clamp(hw/4, 4, 16)` → 8）：9 轮交替中位数
+      TC1 985 vs 1000、TC2 795 vs 796，在噪声里，保持 8。第 8 条只扫到 8/16/32，
+      这次补齐了下方。
+17. **TC1 的 h2d 并不是被 gather 抢内存带宽拖慢的**：时间线里 TC1 的 h2d busy 是
+    0.78 ms，而 8 MiB / 0.78 ms 只有 10.8 GB/s，比隔离测出来的 0.585 ms（14.3 GB/s）
+    差 33%，我一度以为是 gather 把 DRAM 打满、DMA 读不到数。两个证据否掉了它：
+    (a) 线程数从 3 扫到 16，TC1 的 h2d busy 死死钉在 0.765–0.796 ms，与 gather 的并行度
+    完全无关；(b) 那 0.78 ms 里还包含 meta（Q + weights + block_tables + cu_seqlen），
+    按 9.1 MiB 算就是 12.2 GB/s = 峰值的 86%，剩下的 14% 是几条小拷贝各自的固定延迟。
+    所以 TC1 的 h2d 已经没有可榨的空间，v9 也确认了这一点（非临时存储让 gather 的
+    内存流量变了，h2d busy 0.79 → 0.81，纹丝不动）。
+
+18. **压缩 KV 传输（用掉 `cos_diff < 5e-6` 的余量换带宽）**：到 v9，TC2 的 h2d 已经
+    是 130 MiB / 9.84 ms ≈ 97% 的 PCIe 峰值，设备侧再优化的空间是 0，唯一还能动的量是
+    **搬的字节数**。评测只要求 `cos_diff < 5e-6`，而实测是 5.9e-14，看起来有八个数量级
+    的余量，那么把 K 压成 fp8 / int8 再上传（H2D 直接减半，TC2 理论上能再快 1.5–1.9×）
+    似乎是笔好买卖。实测把 gather 出去的 bf16 尾数按 round-half-up 截断到 N 位
+    （N=3 约等于 fp8-e5m3 的精度，N=7 就是原样）：
+
+    | K 的尾数位 | 6 | 5 | 4 | 3（≈fp8） | 2 |
+    |---|---|---|---|---|---|
+    | TC2 `cos_diff` | 7.79e-06 | 2.34e-05 | 8.56e-05 | 3.39e-04 | 1.32e-03 |
+
+    **少一位就已经超标**：`bf16 → 6 位尾数` 就是 7.79e-06 > 5e-06，`FLASH_ASSERT`
+    当场炸掉；fp8 那一档超了 68 倍。每少一位 `cos_diff` 涨约 4 倍（误差平方，符合预期）。
+    也就是说那"八个数量级余量"是个错觉：它衡量的是我的实现相对 bf16 输入有多忠实，
+    而 5e-6 这个阈值刚好卡在"必须完整保留输入的 bf16 精度"上，一位都不许扔。
+    per-token 缩放的 int8（相对页内最大值约 7 位有效精度，典型元素还要更少）同样在
+    这条曲线上，不可能过关。**这条路是被题目的精度门槛封死的，不是被工程难度封死的**，
+    所以也不留开关；实验代码测完就删了。
 
 ## 9. 复现
 
@@ -428,17 +610,26 @@ bash build_local.sh && ./main     # 本机原生 sm_120，避免 JIT
 | `MQA_THREADS` | `clamp(hw/4, 4, 16)` | 主机并行域线程数 |
 | `MQA_MAPOUT` | 开 | 输出直写 mapped pinned（关掉则退回 D2H 拷贝） |
 | `MQA_RAMP` | 关 | 切片大小渐进放大（负结果，见第 8 节） |
+| `MQA_NTCOPY` | `-1`（按 LLC 自动） | gather 用非临时存储：`-1` 自动、`0` 关、`1` 强开（见第 4 节 v9） |
 
 主机线程数已经写在头文件里，不再依赖 `OMP_NUM_THREADS`；显式设置会被
 `num_threads()` 覆盖，只有 `MQA_THREADS` 能改。补 `OMP_PROC_BIND=close
 OMP_PLACES=cores` 能把 TC1 的抖动下限抬高一点，但对中位数没有影响。
 
-形状扫描（额外文件，不影响评测）：
+形状扫描（额外文件，不影响评测）：20 组形状（含 batch 1、ctx 短于一页、
+`max_model_len` 不是 `block_size` 整数倍的尾块、heads/dim/block_size 非评测值等边界），
+逐元素比对参考实现并单独校验 mask：
 
 ```bash
 nvcc -O3 -std=c++17 -gencode arch=compute_120,code=sm_120 -Xcompiler -fopenmp -o shape_test shape_test.cu
 ./shape_test
 ```
+
+最终版本在 17 组配置下各跑了这 20 组形状（`MQA_NTCOPY` 自动/0/1，强制通用 kernel，
+关 mapout，1/4 流，`MQA_CHUNK=2`，`MQA_GCHUNK=1`，常驻 KV，`MQA_RAMP=1`，
+`MQA_THREADS=1/16`，以及非临时存储与上述几项的组合）：**340 次检查全部通过**，
+最大 `cos_diff` 3.2e-14。加上官方 `bash run.sh` 的两个评测形状
+（`cos_diff` 2.675637e-14 / 5.917489e-14）。
 
 ## 10. 还没做的
 
@@ -457,6 +648,11 @@ nvcc -O3 -std=c++17 -gencode arch=compute_120,code=sm_120 -Xcompiler -fopenmp -o
   head 维归约完全留在寄存器里，可以去掉 `sPart` 和每页剩下的 2 次 barrier。
   与上一条冲突（8 warp × 8 token = 64 token 恰好是一整页，容不下半页缓冲），
   只能二选一。主要利好常驻模式，对评测的两个 case 影响在抖动量级。
-- **主机侧 gather 与 DMA 的最后 4% 空泡**：TC2 还有 0.475 ms 的设备空泡，
-  来自每片切片的 OpenMP barrier 与 master 线程发起 DMA 之间的间隙。
-  用一个专职 issue 线程 + 每片原子计数器（而不是 barrier）应该能压掉一部分。
+- ~~**主机侧 gather 与 DMA 的最后 4% 空泡**~~：试过，否掉了，见第 8 节第 13 条。
+  原来的归因是错的 —— TC2 的设备空泡不是"barrier 与 master 发起 DMA 之间的间隙"，
+  而是 gather 本身跟不上 copy engine：专职 issue 线程量到 8.09 ms 的纯等页时间，
+  占了整个调用（约 10.6 ms）的绝大部分。所以这一条剩下的抓手只有两个 ——
+  把 gather 做得更快，或者换到原生 Linux 上重开 kernel 与 H2D 的重叠（本节第一条）。
+  第一个抓手 v9 已经走通了（非临时存储，gather 9.0 → 6.6 ms，上界压到 H2D 的 9.8 ms
+  以下，TC2 +2.6%~+4.7%）；在此之上第 8 节第 4、10、14 条又各撞了一次墙，
+  gather 侧我认为已经到底了。
